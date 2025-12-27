@@ -1,0 +1,62 @@
+name: Sync Images to Aliyun
+# 触发条件：手动触发 (点击 Run workflow 按钮)
+on: 
+  workflow_dispatch:
+    inputs:
+      # 这里允许你手动输入镜像名，如果不输则用默认的
+      image_name:
+        description: 'Image name to sync (e.g., redis:latest)'
+        required: false
+        default: 'all' 
+
+jobs:
+  sync-images:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Skopeo
+        # GitHub 的 ubuntu 环境里通常自带 skopeo，防止万一我们可以装一下
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install skopeo
+
+      - name: Login to Aliyun ACR
+        # 使用我们在第一步配置的 Secrets 登录
+        run: |
+          skopeo login -u "${{ secrets.ALIYUN_USERNAME }}" \
+                       -p "${{ secrets.ALIYUN_PASSWORD }}" \
+                       ${{ secrets.ALIYUN_REGISTRY }}
+
+      - name: Sync Images
+        run: |
+          # 定义你要搬运的镜像映射关系
+          # 格式：原镜像地址 目标镜像地址
+          # 注意：请把下面的 songxuan 换成你自己在上海实际创建的命名空间！
+          
+          declare -A images
+          images=(
+            ["docker.io/library/redis:latest"]="songxuan/redis:latest"
+            ["docker.io/library/mysql:8.0"]="songxuan/mysql:8.0"
+            ["docker.io/library/nginx:alpine"]="songxuan/nginx:alpine"
+          )
+
+          # 如果你在运行界面输入了特定镜像，只同步那一个
+          INPUT_IMAGE="${{ github.event.inputs.image_name }}"
+          
+          if [ "$INPUT_IMAGE" != "all" ] && [ -n "$INPUT_IMAGE" ]; then
+             echo "🚀 单独同步: $INPUT_IMAGE"
+             skopeo copy --all docker://$INPUT_IMAGE docker://${{ secrets.ALIYUN_REGISTRY }}/songxuan/${INPUT_IMAGE##*/}
+             exit 0
+          fi
+
+          # 否则循环同步上面列表里的所有镜像
+          for src in "${!images[@]}"; do
+            dest="${images[$src]}"
+            echo "----------------------------------------------------"
+            echo "🚀 开始同步: $src -> ${{ secrets.ALIYUN_REGISTRY }}/$dest"
+            
+            skopeo copy --all \
+              docker://$src \
+              docker://${{ secrets.ALIYUN_REGISTRY }}/$dest
+              
+            echo "✅ 同步完成"
+          done
