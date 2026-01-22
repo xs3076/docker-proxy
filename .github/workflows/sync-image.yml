@@ -28,27 +28,37 @@ jobs:
 
       - name: Sync Images
         run: |
-          # 定义你要搬运的镜像映射关系
           # 格式：原镜像地址 目标镜像地址
-          # 注意：请把下面的 songxuan 换成你自己在上海实际创建的命名空间！
-          
+          # 左侧：源地址
+          # 右侧：目标地址（不含 Registry 域名，但包含 命名空间/仓库名:标签）
           declare -A images
           images=(
             ["docker.io/library/redis:latest"]="songxuan/redis:latest"
             ["docker.io/library/mysql:8.0"]="songxuan/mysql:8.0"
-            ["docker.io/library/nginx:alpine"]="songxuan/nginx:alpine"
+            ["docker.io/onlyoffice/documentserver:9.2"]="songxuan/onlyoffice/documentserver:9.2"
           )
 
-          # 如果你在运行界面输入了特定镜像，只同步那一个
           INPUT_IMAGE="${{ github.event.inputs.image_name }}"
           
+          # === 处理手动触发逻辑 ===
           if [ "$INPUT_IMAGE" != "all" ] && [ -n "$INPUT_IMAGE" ]; then
              echo "🚀 单独同步: $INPUT_IMAGE"
-             skopeo copy --all docker://$INPUT_IMAGE docker://${{ secrets.ALIYUN_REGISTRY }}/songxuan/${INPUT_IMAGE##*/}
+             
+             # 去除 docker.io/ 前缀 (如果有)
+             CLEAN_IMAGE="${INPUT_IMAGE#docker.io/}"
+             
+             # 处理 library 镜像 (例如输入 redis:alpine，变成 library/redis:alpine，避免变成 songxuan/redis:alpine 导致覆盖冲突? 
+             # 或者你想保持 songxuan/redis:alpine 也是可以的，这里主要针对 onlyoffice 这种非 library 镜像)
+             # 这里直接使用 CLEAN_IMAGE，效果就是 songxuan/onlyoffice/documentserver:9.2
+             
+             DEST_IMAGE="${{ secrets.ALIYUN_REGISTRY }}/songxuan/${CLEAN_IMAGE}"
+             
+             echo "目标地址: $DEST_IMAGE"
+             skopeo copy --all docker://$INPUT_IMAGE docker://$DEST_IMAGE
              exit 0
           fi
 
-          # 否则循环同步上面列表里的所有镜像
+          # === 处理列表循环逻辑 ===
           for src in "${!images[@]}"; do
             dest="${images[$src]}"
             echo "----------------------------------------------------"
