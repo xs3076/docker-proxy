@@ -1,9 +1,7 @@
 name: Sync Images to Aliyun
-# 触发条件：手动触发 (点击 Run workflow 按钮)
 on: 
   workflow_dispatch:
     inputs:
-      # 这里允许你手动输入镜像名，如果不输则用默认的
       image_name:
         description: 'Image name to sync (e.g., redis:latest)'
         required: false
@@ -14,13 +12,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install Skopeo
-        # GitHub 的 ubuntu 环境里通常自带 skopeo，防止万一我们可以装一下
         run: |
           sudo apt-get update
           sudo apt-get -y install skopeo
 
       - name: Login to Aliyun ACR
-        # 使用我们在第一步配置的 Secrets 登录
         run: |
           skopeo login -u "${{ secrets.ALIYUN_USERNAME }}" \
                        -p "${{ secrets.ALIYUN_PASSWORD }}" \
@@ -28,45 +24,51 @@ jobs:
 
       - name: Sync Images
         run: |
-          # 格式：原镜像地址 目标镜像地址
-          # 左侧：源地址
-          # 右侧：目标地址（不含 Registry 域名，但包含 命名空间/仓库名:标签）
+          # 格式：["源地址"]="目标仓库名"
+          # 注意：这里目标仓库名不再带斜杠，由脚本自动处理
           declare -A images
           images=(
-            ["docker.io/library/redis:latest"]="songxuan/redis:latest"
-            ["docker.io/library/mysql:8.0"]="songxuan/mysql:8.0"
-            ["docker.io/onlyoffice/documentserver:9.2"]="songxuan/onlyoffice/documentserver:9.2"
+            ["docker.io/library/redis:latest"]="redis:latest"
+            ["docker.io/library/mysql:8.0"]="mysql:8.0"
+            ["docker.io/onlyoffice/documentserver:9.2"]="onlyoffice-documentserver:9.2"
           )
 
           INPUT_IMAGE="${{ github.event.inputs.image_name }}"
+          MY_NAMESPACE="songxuan" # 你的阿里云命名空间
           
           # === 处理手动触发逻辑 ===
           if [ "$INPUT_IMAGE" != "all" ] && [ -n "$INPUT_IMAGE" ]; then
              echo "🚀 单独同步: $INPUT_IMAGE"
              
-             # 去除 docker.io/ 前缀 (如果有)
-             CLEAN_IMAGE="${INPUT_IMAGE#docker.io/}"
+             # 1. 去除域名和 library/ 前缀 (如果有)
+             TMP_NAME="${INPUT_IMAGE#docker.io/}"
+             TMP_NAME="${TMP_NAME#library/}"
              
-             # 处理 library 镜像 (例如输入 redis:alpine，变成 library/redis:alpine，避免变成 songxuan/redis:alpine 导致覆盖冲突? 
-             # 或者你想保持 songxuan/redis:alpine 也是可以的，这里主要针对 onlyoffice 这种非 library 镜像)
-             # 这里直接使用 CLEAN_IMAGE，效果就是 songxuan/onlyoffice/documentserver:9.2
+             # 2. 提取 Tag
+             TAG="${TMP_NAME##*:}"
+             NAME_NO_TAG="${TMP_NAME%:*}"
+             if [ "$TAG" == "$NAME_NO_TAG" ]; then TAG="latest"; fi
+
+             # 3. 将镜像名中的 / 替换为 - (例如 onlyoffice/documentserver -> onlyoffice-documentserver)
+             CLEAN_NAME=$(echo "$NAME_NO_TAG" | sed 's/\//-/g')
              
-             DEST_IMAGE="${{ secrets.ALIYUN_REGISTRY }}/songxuan/${CLEAN_IMAGE}"
+             DEST_IMAGE="${{ secrets.ALIYUN_REGISTRY }}/$MY_NAMESPACE/${CLEAN_NAME}:${TAG}"
              
              echo "目标地址: $DEST_IMAGE"
+             # 使用 --all 同步所有架构，如果报错可以去掉 --all 只同步当前架构
              skopeo copy --all docker://$INPUT_IMAGE docker://$DEST_IMAGE
              exit 0
           fi
 
           # === 处理列表循环逻辑 ===
           for src in "${!images[@]}"; do
-            dest="${images[$src]}"
+            repo_with_tag="${images[$src]}"
             echo "----------------------------------------------------"
-            echo "🚀 开始同步: $src -> ${{ secrets.ALIYUN_REGISTRY }}/$dest"
+            echo "🚀 开始同步: $src -> ${{ secrets.ALIYUN_REGISTRY }}/$MY_NAMESPACE/$repo_with_tag"
             
             skopeo copy --all \
               docker://$src \
-              docker://${{ secrets.ALIYUN_REGISTRY }}/$dest
+              docker://${{ secrets.ALIYUN_REGISTRY }}/$MY_NAMESPACE/$repo_with_tag
               
             echo "✅ 同步完成"
           done
