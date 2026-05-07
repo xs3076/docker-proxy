@@ -1,0 +1,133 @@
+name: Migrate Images Between Aliyun Namespaces
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_namespace:
+        description: '源命名空间'
+        required: true
+      dest_namespace:
+        description: '目标命名空间'
+        required: true
+      images:
+        description: '镜像清单（逗号分隔，如 redis:latest,mysql。留空 = 迁移整个源命名空间）'
+        required: false
+        default: ''
+      parallelism:
+        description: '并行迁移数'
+        required: false
+        default: '8'
+
+concurrency:
+  group: migrate-${{ github.event.inputs.source_namespace }}-${{ github.event.inputs.dest_namespace }}
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install skopeo jq
+
+      - name: Login to Aliyun ACR
+        run: |
+          skopeo login -u "${{ secrets.ALIYUN_USERNAME }}" \
+                       -p "${{ secrets.ALIYUN_PASSWORD }}" \
+                       "${{ secrets.ALIYUN_REGISTRY }}"
+
+      - name: Build migration list
+        env:
+          ALIYUN_REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+          ALIYUN_ACCESS_KEY: ${{ secrets.ALIYUN_ACCESS_KEY }}
+          ALIYUN_ACCESS_SECRET: ${{ secrets.ALIYUN_ACCESS_SECRET }}
+          SRC_NS: ${{ github.event.inputs.source_namespace }}
+          INPUT_IMAGES: ${{ github.event.inputs.images }}
+        run: |
+          set -euo pipefail
+          : > /tmp/migrate-list.txt
+
+          cr_api() { python3 scripts/aliyun_cr.py GET "$1"; }
+
+          list_tags() {
+            local ns="$1" repo="$2"
+            cr_api "/repos/${ns}/${repo}/tags?PageSize=100" 2>/dev/null \
+              | jq -r '.data.tags[]?.tag'
+          }
+
+          if [ -z "$INPUT_IMAGES" ]; then
+            echo "🔍 列出命名空间 ${SRC_NS} 下所有 repo + tag..."
+            page=1
+            while :; do
+              resp=$(cr_api "/repos/${SRC_NS}?Page=${page}&PageSize=100" 2>/dev/null) || break
+              repos=$(echo "$resp" | jq -r '.data.repos[]?.repoName')
+              [ -z "$repos" ] && break
+              while IFS= read -r repo; do
+                while IFS= read -r tag; do
+                  [ -n "$tag" ] && echo "${repo}:${tag}" >> /tmp/migrate-list.txt
+                done < <(list_tags "$SRC_NS" "$repo")
+              done <<< "$repos"
+              total=$(echo "$resp" | jq -r '.data.total // 0')
+              [ $((page * 100)) -ge "$total" ] && break
+              page=$((page + 1))
+            done
+          else
+            IFS=',' read -ra entries <<< "$INPUT_IMAGES"
+            for raw in "${entries[@]}"; do
+              entry=$(echo "$raw" | xargs)
+              [ -z "$entry" ] && continue
+              if [[ "$entry" == *:* ]]; then
+                echo "$entry" >> /tmp/migrate-list.txt
+              else
+                while IFS= read -r tag; do
+                  [ -n "$tag" ] && echo "${entry}:${tag}" >> /tmp/migrate-list.txt
+                done < <(list_tags "$SRC_NS" "$entry")
+              fi
+            done
+          fi
+
+          count=$(wc -l < /tmp/migrate-list.txt | tr -d ' ')
+          echo "📋 共 ${count} 个 image:tag 待迁移："
+          cat /tmp/migrate-list.txt
+
+      - name: Migrate images in parallel
+        env:
+          REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+          SRC_NS: ${{ github.event.inputs.source_namespace }}
+          DST_NS: ${{ github.event.inputs.dest_namespace }}
+          PARALLELISM: ${{ github.event.inputs.parallelism }}
+        run: |
+          set -uo pipefail
+          export REGISTRY SRC_NS DST_NS
+
+          if [ ! -s /tmp/migrate-list.txt ]; then
+            echo "⚠️  空列表，无需迁移"
+            exit 0
+          fi
+
+          migrate_one() {
+            local entry="$1"
+            local src="docker://${REGISTRY}/${SRC_NS}/${entry}"
+            local dst="docker://${REGISTRY}/${DST_NS}/${entry}"
+            echo "🚀 [start] ${entry}"
+            if skopeo copy --all --retry-times 1 "$src" "$dst" 2>&1 | sed "s|^|    [${entry}] |"; then
+              echo "✅ [done]  ${entry}"
+            else
+              echo "❌ [fail]  ${entry}"
+              return 1
+            fi
+          }
+          export -f migrate_one
+
+          xargs -P "$PARALLELISM" -I {} bash -c 'migrate_one "$@"' _ {} < /tmp/migrate-list.txt
+          EXIT=$?
+
+          if [ "$EXIT" -eq 0 ]; then
+            echo "🎉 全部迁移完成"
+          else
+            echo "⚠️  迁移过程出现错误（exit=${EXIT}），请翻看上方日志中的 ❌ 条目"
+          fi
+          exit "$EXIT"
