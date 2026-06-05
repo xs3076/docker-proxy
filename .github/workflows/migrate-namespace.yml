@@ -1,4 +1,28 @@
-name: Migrate Images Between Aliyun Namespaces
+name: Migrate Images Between Aliyun Namespaces (跨账号)
+
+# ──────────────────────────────────────────────────────────────────────────
+# 跨账号迁移阿里云 ACR 镜像
+#
+# 需要在 GitHub 仓库配置以下 Secrets：
+#   Settings → Secrets and variables → Actions → New repository secret
+#
+#   【源账号（被迁移方）】
+#     SRC_ALIYUN_REGISTRY        源 registry 地址，如 registry.cn-hangzhou.aliyuncs.com
+#     SRC_ALIYUN_USERNAME        源 ACR 登录用户名（通常是阿里云账号全名 / 子账号）
+#     SRC_ALIYUN_PASSWORD        源 ACR 登录密码（个人版的“访问凭证”密码）
+#     SRC_ALIYUN_ACCESS_KEY      源账号 RAM AccessKey ID（仅用于调 OpenAPI 列 repo/tag）
+#     SRC_ALIYUN_ACCESS_SECRET   源账号 RAM AccessKey Secret
+#
+#   【目标账号（接收方）】
+#     DST_ALIYUN_REGISTRY        目标 registry 地址，如 registry.cn-shenzhen.aliyuncs.com
+#     DST_ALIYUN_USERNAME        目标 ACR 登录用户名
+#     DST_ALIYUN_PASSWORD        目标 ACR 登录密码
+#
+# 说明：
+#   - 列举源命名空间下的 repo/tag 走阿里云 OpenAPI，所以只需要“源账号”的 AccessKey。
+#   - 如果你每次都手动指定 images 清单（不留空），其实可以不配 SRC_ALIYUN_ACCESS_KEY/SECRET。
+#   - region 会自动从对应的 registry 地址里推导。
+# ──────────────────────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch:
@@ -33,17 +57,24 @@ jobs:
           sudo apt-get update
           sudo apt-get -y install skopeo jq
 
-      - name: Login to Aliyun ACR
+      - name: Login to source & dest ACR
         run: |
-          skopeo login -u "${{ secrets.ALIYUN_USERNAME }}" \
-                       -p "${{ secrets.ALIYUN_PASSWORD }}" \
-                       "${{ secrets.ALIYUN_REGISTRY }}"
+          echo "🔐 登录源 registry: ${{ secrets.SRC_ALIYUN_REGISTRY }}"
+          skopeo login -u "${{ secrets.SRC_ALIYUN_USERNAME }}" \
+                       -p "${{ secrets.SRC_ALIYUN_PASSWORD }}" \
+                       "${{ secrets.SRC_ALIYUN_REGISTRY }}"
+
+          echo "🔐 登录目标 registry: ${{ secrets.DST_ALIYUN_REGISTRY }}"
+          skopeo login -u "${{ secrets.DST_ALIYUN_USERNAME }}" \
+                       -p "${{ secrets.DST_ALIYUN_PASSWORD }}" \
+                       "${{ secrets.DST_ALIYUN_REGISTRY }}"
 
       - name: Build migration list
         env:
-          ALIYUN_REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
-          ALIYUN_ACCESS_KEY: ${{ secrets.ALIYUN_ACCESS_KEY }}
-          ALIYUN_ACCESS_SECRET: ${{ secrets.ALIYUN_ACCESS_SECRET }}
+          # aliyun_cr.py 读取的变量 —— 用“源账号”的凭证列 repo/tag
+          ALIYUN_REGISTRY: ${{ secrets.SRC_ALIYUN_REGISTRY }}
+          ALIYUN_ACCESS_KEY: ${{ secrets.SRC_ALIYUN_ACCESS_KEY }}
+          ALIYUN_ACCESS_SECRET: ${{ secrets.SRC_ALIYUN_ACCESS_SECRET }}
           SRC_NS: ${{ github.event.inputs.source_namespace }}
           INPUT_IMAGES: ${{ github.event.inputs.images }}
         run: |
@@ -95,13 +126,14 @@ jobs:
 
       - name: Migrate images in parallel
         env:
-          REGISTRY: ${{ secrets.ALIYUN_REGISTRY }}
+          SRC_REGISTRY: ${{ secrets.SRC_ALIYUN_REGISTRY }}
+          DST_REGISTRY: ${{ secrets.DST_ALIYUN_REGISTRY }}
           SRC_NS: ${{ github.event.inputs.source_namespace }}
           DST_NS: ${{ github.event.inputs.dest_namespace }}
           PARALLELISM: ${{ github.event.inputs.parallelism }}
         run: |
           set -uo pipefail
-          export REGISTRY SRC_NS DST_NS
+          export SRC_REGISTRY DST_REGISTRY SRC_NS DST_NS
 
           if [ ! -s /tmp/migrate-list.txt ]; then
             echo "⚠️  空列表，无需迁移"
@@ -110,8 +142,8 @@ jobs:
 
           migrate_one() {
             local entry="$1"
-            local src="docker://${REGISTRY}/${SRC_NS}/${entry}"
-            local dst="docker://${REGISTRY}/${DST_NS}/${entry}"
+            local src="docker://${SRC_REGISTRY}/${SRC_NS}/${entry}"
+            local dst="docker://${DST_REGISTRY}/${DST_NS}/${entry}"
             echo "🚀 [start] ${entry}"
             if skopeo copy --all --retry-times 1 "$src" "$dst" 2>&1 | sed "s|^|    [${entry}] |"; then
               echo "✅ [done]  ${entry}"
