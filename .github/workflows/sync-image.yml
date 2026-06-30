@@ -34,7 +34,7 @@ jobs:
           )
 
           INPUT_IMAGE="${{ github.event.inputs.image_name }}"
-          MY_NAMESPACE="songxuan" # 你的阿里云命名空间
+          MY_NAMESPACE="rs-cr" # 你的阿里云命名空间
           
           # === 处理手动触发逻辑 ===
           if [ "$INPUT_IMAGE" != "all" ] && [ -n "$INPUT_IMAGE" ]; then
